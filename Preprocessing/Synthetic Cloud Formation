@@ -1,0 +1,336 @@
+import os
+import cv2
+import random
+import shutil
+import numpy as np
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+
+# ============================================================
+# 1. FBM NOISE  (same as before, unchanged)
+# ============================================================
+
+def fbm_noise(h, w, octaves=4, persistence=0.55, base_scale=256):
+    """
+    Fractal Brownian Motion noise.
+
+    CRITICAL PARAMETER: base_scale
+    ────────────────────────────────────────────────────────────
+    DeepGlobe tiles are ~1024×1024 px covering ≈500 m of ground.
+    A real cumulus cloud is 500 m – 5 km wide, i.e. often LARGER
+    than the whole image.  To reflect that:
+
+        base_scale = h // 4  (= 256 for 1024-px images)
+
+    This starts the coarsest noise at a 4×4 grid which,
+    when bicubic-upsampled to 1024×1024, creates features
+    ~256 px wide — the right order of magnitude for cloud masses.
+
+    Keeping octaves LOW (3–4) is equally important: more octaves
+    add fine detail and fragment the cloud into the 'many small
+    puffs' problem seen with the v1 code.
+    """
+    noise = np.zeros((h, w), dtype=np.float32)
+    amplitude = 1.0
+    total = 0.0
+    scale = base_scale
+
+    for _ in range(octaves):
+        nh = max(2, h // scale)
+        nw = max(2, w // scale)
+        layer = np.random.rand(nh, nw).astype(np.float32)
+        layer = cv2.resize(layer, (w, h), interpolation=cv2.INTER_CUBIC)
+        noise += layer * amplitude
+        total += amplitude
+        amplitude *= persistence
+        scale = max(1, scale // 2)
+
+    noise /= total
+    lo, hi = noise.min(), noise.max()
+    if hi > lo:
+        noise = (noise - lo) / (hi - lo)
+    return noise
+
+
+# ============================================================
+# 2. LARGE-SCALE DOMAIN WARP
+# ============================================================
+
+def domain_warp(field, h, w, strength=180):
+    """
+    Bends the cloud shape with noise-driven displacement.
+
+    KEY CHANGE from v1: displacement noise now uses a LARGE
+    base_scale (h//8 on the quarter-res grid = 32 for 1024-px).
+    This creates big sweeping bends (100-400 px), not tiny ripples.
+    """
+    dh, dw = max(8, h // 4), max(8, w // 4)
+    # Large-scale displacement: base_scale=32 on 256×256 grid
+    # → feature size ≈ 32 px in the displacement map
+    # → ×4 when upsampled → 128 px deformation features
+    base = max(dh // 8, 4)
+    dx = (fbm_noise(dh, dw, octaves=3, persistence=0.6, base_scale=base) - 0.5) * 2 * strength
+    dy = (fbm_noise(dh, dw, octaves=3, persistence=0.6, base_scale=base) - 0.5) * 2 * strength
+    dx = cv2.resize(dx, (w, h), interpolation=cv2.INTER_CUBIC)
+    dy = cv2.resize(dy, (w, h), interpolation=cv2.INTER_CUBIC)
+
+    y_g, x_g = np.mgrid[0:h, 0:w].astype(np.float32)
+    x_w = np.clip(x_g + dx, 0, w - 1)
+    y_w = np.clip(y_g + dy, 0, h - 1)
+    return cv2.remap(field, x_w, y_w, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+
+# ============================================================
+# 3. BUILD CLOUD ALPHA MAP  (completely redesigned)
+# ============================================================
+
+def build_cloud_alpha(h, w):
+    """
+    Returns a float32 [0, 1] alpha map for ONE large cloud system.
+
+    Why one system, not 3?
+    ────────────────────────────────────────────────────────────
+    A 1024×1024 DeepGlobe tile ≈ 500 m × 500 m of ground.
+    Cumulus cloud diameter: 500 m – 5 km.
+    → A single cloud already dwarfs the image.
+    → Multiple independent clouds in 500 m is physically unrealistic.
+
+    Stage breakdown
+    ────────────────────────────────────────────────────────────
+    1. GAUSSIAN ENVELOPE   — a single large ellipse (possibly
+       extending off-image) defines where the cloud mass sits.
+       Using a Gaussian instead of FBM here prevents the many-
+       small-patches fragmentation that plagued v1.
+
+    2. LARGE-SCALE TEXTURE — FBM with base_scale = h//4 and only
+       4 octaves keeps all features ≥ 32 px.  No fine grain.
+
+    3. DOMAIN WARP         — large-scale bending turns the smooth
+       ellipse into an organic, irregular mass.
+
+    4. THRESHOLD + POWER   — controls coverage density.
+
+    5. OPACITY CAP         — real satellite clouds are semi-transparent.
+    """
+
+    # ── 1. Single large Gaussian spatial envelope ─────────────────────────────
+    # Center can be off-image so the cloud enters from an edge (very realistic).
+    cx = random.uniform(-0.25 * w, 1.25 * w)
+    cy = random.uniform(-0.25 * h, 1.25 * h)
+
+    # Cloud can be as wide as the whole image (or wider)
+    sigma_x = random.uniform(0.40 * w, 1.10 * w)
+    sigma_y = random.uniform(0.35 * h, 1.00 * h)
+    angle   = random.uniform(0, np.pi)           # elongated clouds
+
+    y_g, x_g = np.mgrid[0:h, 0:w].astype(np.float32)
+    cos_a, sin_a = np.cos(angle), np.sin(angle)
+    dx = x_g - cx;  dy = y_g - cy
+    x_rot =  dx * cos_a + dy * sin_a
+    y_rot = -dx * sin_a + dy * cos_a
+
+    envelope = np.exp(-0.5 * ((x_rot / sigma_x) ** 2 + (y_rot / sigma_y) ** 2))
+
+    # ── 2. Large-scale FBM texture ────────────────────────────────────────────
+    # base_scale = h//4  →  for 1024 px: starts at 4×4 grid → ~256 px features
+    # 4 octaves: feature sizes ≈ 256, 128, 64, 32 px — all large, no fine grain
+    large_scale = max(h // 4, 32)
+    detail = fbm_noise(h, w, octaves=4, persistence=0.55, base_scale=large_scale)
+
+    # ── 3. Large-scale domain warp ────────────────────────────────────────────
+    warp_strength = random.randint(120, 280)
+    detail = domain_warp(detail, h, w, warp_strength)
+
+    # ── 4. Multiply texture by envelope ──────────────────────────────────────
+    combined = detail * envelope
+    if combined.max() > 0:
+        combined /= combined.max()
+
+    # ── 5. Threshold + power curve ────────────────────────────────────────────
+    # Lower threshold → denser coverage; higher → thinner, more patchy cloud
+    thresh = random.uniform(0.22, 0.52)
+    alpha  = np.clip((combined - thresh) / (1.0 - thresh + 1e-8), 0, 1)
+    alpha  = alpha ** random.uniform(0.5, 1.3)   # < 1 = more coverage
+
+    # ── 6. Semi-transparent — terrain visible through real satellite clouds ───
+    alpha *= random.uniform(0.58, 0.92)
+
+    return alpha.astype(np.float32)
+
+
+# ============================================================
+# 4. MAIN AUGMENTATION  (1 cloud system per image)
+# ============================================================
+
+def add_realistic_clouds(img):
+    """
+    Composites ONE large photorealistic cloud system onto a satellite tile.
+
+    Compared with v1
+    ────────────────────────────────────────────────────────────
+    ✗ REMOVED  : multiple small systems (1–3)  →  was the root of fragmentation
+    ✓ NOW      : exactly ONE large coherent cloud mass per image
+    ✓ NOW      : large-scale FBM (base_scale = h//4) — no tiny puffs
+    ✓ NOW      : shadow uses a bigger offset + heavier blur to match scale
+    ✓ KEPT     : semi-transparency, off-white tint, domain warping
+    """
+    result = img.copy().astype(np.float32)
+    h, w = result.shape[:2]
+
+    alpha = build_cloud_alpha(h, w)
+
+    # ── Shadow ────────────────────────────────────────────────────────────────
+    # Offset scaled to image size (not a fixed pixel count).
+    # The shadow is always more diffuse than the cloud boundary.
+    sdx = int(random.uniform(-0.12 * w, 0.12 * w))
+    sdy = int(random.uniform( 0.04 * h, 0.18 * h))   # displaced downward (sun angle)
+
+    shadow = np.roll(np.roll(alpha, sdy, axis=0), sdx, axis=1)
+
+    # Large blur kernel — shadow edges are always softer than cloud edges
+    bk = random.choice(range(81, 201, 2))
+    shadow = cv2.GaussianBlur(shadow, (bk, bk), 0)
+    shadow *= random.uniform(0.35, 0.65)
+
+    result = result * (1.0 - shadow[:, :, np.newaxis])   # darken under shadow
+
+    # ── Cloud colour (off-white, faint blue-grey tint) ────────────────────────
+    b_val = random.uniform(244, 255)   # slight blue lift
+    g_val = random.uniform(248, 255)
+    r_val = random.uniform(250, 255)
+    cloud_color = np.array([b_val, g_val, r_val], dtype=np.float32)  # BGR
+
+    result = result * (1.0 - alpha[:, :, np.newaxis]) + cloud_color * alpha[:, :, np.newaxis]
+
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+# ============================================================
+# 5. PIPELINE: SPLIT → AUGMENT → SAVE
+# ============================================================
+
+def generate_cloudy_dataset(
+    source_dir,
+    output_base,
+    test_split=0.15,
+    cloud_fraction=0.50,
+    seed=42,
+):
+    """
+    Builds the final dataset:
+      • cloud_fraction of each split → realistic large-cloud augmentation
+      • remaining images             → pixel-perfect clean originals
+      • masks                        → always copied unmodified
+
+    Args:
+        source_dir     : DeepGlobe dir with *_sat.jpg + *_mask.png pairs
+        output_base    : Root of generated dataset
+        test_split     : Hold-out fraction for testing (default 0.15)
+        cloud_fraction : Fraction of each split receiving clouds (default 0.50)
+        seed           : Fixes train/test split and cloudy-image selection
+    """
+    split_rng = random.Random(seed)   # isolated RNG — cloud texture stays random
+
+    for split in ('train', 'test'):
+        os.makedirs(os.path.join(output_base, split, 'images'), exist_ok=True)
+        os.makedirs(os.path.join(output_base, split, 'masks'),  exist_ok=True)
+
+    all_images = sorted(f for f in os.listdir(source_dir) if f.endswith('_sat.jpg'))
+    if not all_images:
+        print("❌  No *_sat.jpg files found — check DEEPGLOBE_INPUT_DIR.")
+        return
+
+    print(f"🔍  Found {len(all_images)} images → "
+          f"{int((1-test_split)*100)}% train / {int(test_split*100)}% test")
+
+    train_imgs, test_imgs = train_test_split(
+        all_images, test_size=test_split, random_state=seed
+    )
+
+    def process_split(image_list, split_name):
+        print(f"\n🚀  [{split_name.upper()}]  {len(image_list)} images")
+        n_cloudy = int(len(image_list) * cloud_fraction)
+        cloudy_idx = set(split_rng.sample(range(len(image_list)), n_cloudy))
+        print(f"   ☁️   {n_cloudy}  → large-cloud augmentation")
+        print(f"   🌤   {len(image_list) - n_cloudy}  → clean originals")
+
+        for idx, img_name in enumerate(tqdm(image_list, desc=split_name)):
+            base_id       = img_name.replace('_sat.jpg', '')
+            src_img       = os.path.join(source_dir, img_name)
+            src_mask      = os.path.join(source_dir, f"{base_id}_mask.png")
+            if not os.path.exists(src_mask):
+                continue
+
+            dst_img  = os.path.join(output_base, split_name, 'images', f"image_{idx:05d}.jpg")
+            dst_mask = os.path.join(output_base, split_name, 'masks',  f"mask_{idx:05d}.png")
+
+            img = cv2.imread(src_img)
+            if img is None:
+                continue
+
+            out = add_realistic_clouds(img) if idx in cloudy_idx else img
+            cv2.imwrite(dst_img, out)
+            shutil.copy(src_mask, dst_mask)
+
+    process_split(train_imgs, 'train')
+    process_split(test_imgs,  'test')
+    print(f"\n✅  Dataset ready at: {output_base}")
+
+
+# ============================================================
+# 6. QUICK VISUAL PREVIEW
+# ============================================================
+
+def preview_on_image(src_path, out_path, n_variants=4):
+    """
+    Saves [original | variant_1 | ... | variant_N] side-by-side for QC.
+
+    Usage in a Kaggle notebook:
+        from cloud_augmentation_v2 import preview_on_image
+        preview_on_image(
+            '/kaggle/input/.../000000_sat.jpg',
+            '/kaggle/working/cloud_preview.jpg',
+            n_variants=4,
+        )
+    """
+    img = cv2.imread(src_path)
+    if img is None:
+        print(f"❌  Could not load: {src_path}")
+        return
+
+    h, w  = img.shape[:2]
+    scale = 512 / max(h, w)
+    th, tw = int(h * scale), int(w * scale)
+
+    tiles = [cv2.resize(img, (tw, th))]
+    for _ in range(n_variants):
+        aug = add_realistic_clouds(img)
+        tiles.append(cv2.resize(aug, (tw, th)))
+
+    cv2.imwrite(out_path, np.concatenate(tiles, axis=1))
+    print(f"✅  Preview ({n_variants} variants + original) → {out_path}")
+
+
+# ============================================================
+# 7. ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    DEEPGLOBE_INPUT_DIR = '/kaggle/input/datasets/balraj98/deepglobe-road-extraction-dataset/train'
+    OUTPUT_DIRECTORY    = '/kaggle/working/cloudy_dataset_v2'
+
+    # Sanity-check on one image first (recommended before full run):
+    # preview_on_image(
+    #     src_path   = os.path.join(DEEPGLOBE_INPUT_DIR, '000000_sat.jpg'),
+    #     out_path   = '/kaggle/working/cloud_preview.jpg',
+    #     n_variants = 4,
+    # )
+
+    generate_cloudy_dataset(
+        source_dir     = DEEPGLOBE_INPUT_DIR,
+        output_base    = OUTPUT_DIRECTORY,
+        test_split     = 0.15,
+        cloud_fraction = 0.50,
+        seed           = 42,
+    )
